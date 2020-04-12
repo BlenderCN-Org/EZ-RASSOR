@@ -1,7 +1,11 @@
 #! /usr/bin/env python
+import os
 
 import rospy
 import actionlib
+
+from path_planner import PathPlanner
+from swarm_utils import euclidean2D
 from ezrassor_swarm_control.msg import *
 from geometry_msgs.msg import Point
 from ezrassor_swarm_control.msg import Path
@@ -23,6 +27,7 @@ class WaypointClient:
                          Path,
                          self.send_path)
 
+        # Service which allows the waypoint client's current path to be preempted from any other node
         self.preempt_service = rospy.Service('preempt_path', PreemptPath, self.preempt_path)
 
         # Minimum amount of battery a rover needs to continue along a path
@@ -31,7 +36,23 @@ class WaypointClient:
         # Whether a path has been canceled or not
         self.preempt = False
 
-    def preempt_path(self, request):
+        # Waypoint the rover is currently moving towards
+        self.cur_waypoint = None
+
+        # Ultimate goal the rover is moving towards (usually a dig site or charging station)
+        self.goal = None
+
+        # Max distance a rover can veer from its current waypoint before a new path is generated
+        self.max_veer_distance = 5
+
+        # Create path planner to be used during replanning
+        height_map = os.path.join(os.path.expanduser('~'),
+                                  '.gazebo', 'models', 'random', 'materials', 'textures', 'random_map.jpg')
+
+        self.path_planner = PathPlanner(height_map, rover_max_climb_slope=1)
+
+    def preempt_path(self, request=None):
+        """Callback executed when the waypoint client receives a preempt path request"""
         self.preempt = True
         self.client.cancel_goal()
 
@@ -43,18 +64,19 @@ class WaypointClient:
         x = round(feedback.pose.position.x, 2)
         y = round(feedback.pose.position.y, 2)
 
-        #rospy.loginfo('Waypoint client {} received feedback! position: {} battery: {}'.
+        # rospy.loginfo('Waypoint client {} received feedback! position: {} battery: {}'.
         #              format((self.namespace + self.client_name), (x, y), feedback.battery))
 
-        # Tell rover to stop trying to reach its current waypoint if it's low on battery
-        if feedback.battery < self.min_battery_needed:
-            self.preempt = True
-            self.client.cancel_goal()
+        # Replan path if rover veers off its path too much
+        if self.goal is not None and self.cur_waypoint is not None:
+            veer_distance = euclidean2D(feedback.pose.position, self.cur_waypoint)
 
-            """PLAN NEW PATH TO A CHARGING STATION AND SEND IT TO THE ROVER"""
+            if veer_distance > self.max_veer_distance:
+                rospy.loginfo('Waypoint client {} forced to replan path!'.format(self.namespace + self.client_name))
+                self.preempt_path()
 
-        # Replan if rover veers off its path too much
-        """IMPLEMENT REPLANNING HERE"""
+                new_path = self.path_planner.find_path(feedback.pose.position, self.goal)
+                self.send_path(new_path)
 
     def done_cb(self, status, result):
         """Callback executed when the rover reaches a waypoint or the request is preempted"""
@@ -68,7 +90,6 @@ class WaypointClient:
         else:
             rospy.loginfo('Waypoint client {} reached waypoint! Current position: {} Current battery: {}'.
                           format((self.namespace + self.client_name), (x, y), result.battery))
-
 
     def send_waypoint(self, waypoint):
 
@@ -88,19 +109,24 @@ class WaypointClient:
         rospy.loginfo('Waypoint client {} received path from {} to {}'.
                       format(self.namespace + self.client_name, (path[0].x, path[0].y), (path[-1].x, path[-1].y)))
 
+        # Set rover's ultimate goal as the path's last waypoint
+        self.goal = path[-1]
+
         # Send each waypoint in a path to the rover
         for node in path:
+            # If request was canceled stop sending waypoints
             if self.preempt:
-                # If request was canceled, reset server to receive a new request in the future
-                self.preempt = False
-
-                # Return to stop sending waypoints
-                return
+                break
 
             # Sends the waypoint to a rover
+            self.cur_waypoint = node
             self.send_waypoint(node)
 
-        rospy.loginfo('Waypoint client {} succeeded, path completed!'.format(self.namespace + self.client_name))
+        rospy.loginfo('Waypoint client {} finished sending waypoints!'.format(self.namespace + self.client_name))
+        # Reset server to receive another path
+        self.preempt = False
+        self.cur_waypoint = None
+        self.goal = None
 
 
 def on_start_up(robot_num):
